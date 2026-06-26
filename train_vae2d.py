@@ -1,6 +1,5 @@
 import os
 import json
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,71 +11,77 @@ import time
 from models.CDC import keyframe_compressor as compress_modules
 import torch
 from utils import *
-from tools_online.compress.metrics import relative_rmse_error_ornl
 from tools_online.io.json_io import save_json
 
 
-def train_epoch_vae(model, loader, optimizer, scheduler, criterion, loss_beta, device, iteration = 0):
-    """Train the model for one epoch."""
+def relative_rmse_error_ornl(original, reconstructed, device=None):
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    original = torch.as_tensor(original, dtype=torch.float32, device=device)
+    reconstructed = torch.as_tensor(reconstructed, dtype=torch.float32, device=device)
+
+    rmse = torch.sqrt(torch.mean((original - reconstructed) ** 2))
+    data_range = torch.max(original) - torch.min(original)
+
+    relative_rmse = torch.where(data_range != 0,
+                                rmse / data_range,
+                                torch.tensor(0.0, device=device))
+    return relative_rmse
+
+def train_epoch_vae(model, loader, optimizer, scheduler, criterion, loss_beta, device, iteration=0):
     model.train()
-    running_loss1 = 0.0
-    running_loss2 = 0.0
-    
+    running_loss1 = torch.zeros(1, device=device)
+    running_loss2 = torch.zeros(1, device=device)
+    n_samples = 0
+
     for data_dict in loader:
-        
-        inputs  = data_dict["input"].to(device)
+        inputs = data_dict["input"].to(device, non_blocking=True)
         targets = inputs
- 
-        optimizer.zero_grad()
+
+        optimizer.zero_grad(set_to_none=True)  # cheaper than zeroing
         results = model(inputs)
-        
         outputs = results["output"]
-        
+
         loss_mse = criterion(outputs, targets)
-        loss_bpp = results["bpp"].mean()
-        
-        loss_bpp = loss_bpp * loss_beta
-        
-        loss =  (loss_mse  + loss_bpp) if loss_beta>0.0 else loss_mse
-        
+        loss_bpp = results["bpp"].mean() * loss_beta
+        loss = loss_mse + loss_bpp if loss_beta > 0.0 else loss_mse
+
         loss.backward()
         optimizer.step()
         scheduler.step()
-        
-        running_loss1 += loss_mse.item() * inputs.size(0)
-        running_loss2 += loss_bpp.item() * inputs.size(0)
-        
-        iteration+=1
-    
-    epoch_loss1 = running_loss1 / len(loader.dataset)
-    epoch_loss2 = running_loss2 / len(loader.dataset)
-    
+
+        # no .item() here — stays a GPU tensor, no sync
+        running_loss1 += loss_mse.detach() * inputs.size(0)
+        running_loss2 += loss_bpp.detach() * inputs.size(0)
+        n_samples += inputs.size(0)
+        iteration += 1
+
+    epoch_loss1 = (running_loss1 / n_samples).item()
+    epoch_loss2 = (running_loss2 / n_samples).item()
+
     return epoch_loss1, epoch_loss2, iteration
 
 def test_epoch_vae(model, loader, criterion, device):
-    """Test the model and compute the reconstruction results."""
     model.eval()
-    all_data = []
-    
-    recons_data = torch.zeros_like(loader.dataset.data_input)
+    recons_data = torch.zeros_like(loader.dataset.data_input, device=device)
+    bit_count = torch.zeros(1, device=device)
 
-    
-    bit_count = 0
-    
     with torch.no_grad():
         for data_dict in loader:
-            inputs  = data_dict["input"].to(device)
-            targets = data_dict["input"].cpu()
+            inputs = data_dict["input"].to(device, non_blocking=True)
+            scale  = data_dict["scale"].to(device, non_blocking=True)
+            offset = data_dict["offset"].to(device, non_blocking=True)
 
             results = model(inputs)
-            outputs = results["output"].detach().cpu()*data_dict["scale"] + data_dict["offset"]
-            bit_count += torch.sum(results["frame_bit"].detach().cpu()).item()
+            outputs = results["output"] * scale + offset  # stays on GPU
+            bit_count += results["frame_bit"].detach().sum()
 
+            idx0, idx1, start_t, end_t = data_dict["index"]
             for i in range(len(inputs)):
-                idx0, idx1, start_t, end_t = data_dict["index"]
                 recons_data[idx0[i], idx1[i], start_t[i]:end_t[i]] = outputs[i]
 
-    return recons_data, bit_count
+    return recons_data.cpu(), bit_count.item()  # single sync at the very end
 
 class Info:
     def __init__(self,data_name, bpp = 32, model_path = None, json_path =None):
@@ -178,7 +183,8 @@ if __name__ == "__main__":
     print("Length for Each dataset", [len(dataset) for dataset in train_datasets])
     merged_dataset = ConcatDataset(train_datasets)
     
-    train_loader = DataLoader(merged_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+   train_loader = DataLoader(merged_dataset, batch_size=args.batch_size, shuffle=True,
+                           num_workers=6, pin_memory=True)
     
     
 

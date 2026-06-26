@@ -42,29 +42,32 @@ def block_hw(data, block_size=(256, 256)):
     V, S, T, H, W = data.shape
     h_block, w_block = block_size
 
-    # Compute padding for height to nearest multiple of h_block
     H_target = math.ceil(H / h_block) * h_block
     dh = H_target - H
     top, down = dh // 2, dh - dh // 2
     n_h = H_target // h_block
 
-    # Compute padding for width to nearest multiple of w_block
     W_target = math.ceil(W / w_block) * w_block
     dw = W_target - W
     left, right = dw // 2, dw - dw // 2
     n_w = W_target // w_block
-    
-    V1, S1, T1, H1, W1 = data.shape
-    data = data.view(V1*S1,T1, H1, W1)
-    # Apply reflection padding (order: W_left, W_right, H_top, H_bottom)
-    data = F.pad(data, (left, right, top, down), mode='reflect')
-    data = data.view(V1, S1, T1,*data.shape[-2:])
-    # Update shape after padding
-    V, S, T, H_p, W_p = data.shape
 
-    # Reshape and split along H and W into blocks
+    V1, S1, T1, H1, W1 = data.shape
+    data = data.view(V1*S1, T1, H1, W1)
+
+    # reflect padding requires pad amount < input size on that dim;
+    # fall back to zero-padding when the block is larger than H or W
+    if max(top, down) < H1 and max(left, right) < W1:
+        pad_mode = 'reflect'
+    else:
+        pad_mode = 'constant'
+
+    data = F.pad(data, (left, right, top, down), mode=pad_mode)
+    data = data.view(V1, S1, T1, *data.shape[-2:])
+
+    V, S, T, H_p, W_p = data.shape
     data = data.reshape(V, S, T, n_h, h_block, n_w, w_block)
-    data = data.permute(0, 1, 3, 5, 2, 4, 6)  # [V, S, n_h, n_w, T, h_block, w_block]
+    data = data.permute(0, 1, 3, 5, 2, 4, 6)
     data = data.reshape(V, S * n_h * n_w, T, h_block, w_block)
 
     padding = (top, down, left, right)
@@ -193,7 +196,15 @@ class BaseDataset(Dataset):
             pad_size = self.train_size - cur_size
             pad_left = pad_size // 2
             pad_right = pad_size - pad_left
-            data = F.pad(data[None], (pad_left, pad_right, pad_left, pad_right), mode='reflect')[0]
+
+            # reflect padding requires pad < input size along that dim;
+            # fall back to zero-padding when the requested pad is too large
+            if max(pad_left, pad_right) < cur_size:
+                mode = 'reflect'
+            else:
+                mode = 'constant'
+
+            data = F.pad(data[None], (pad_left, pad_right, pad_left, pad_right), mode=mode)[0]
         elif self.train_size < cur_size:
             data = self.random_crop(data)
         return data
