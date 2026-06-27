@@ -3,15 +3,54 @@ import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, ConcatDataset
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, ConcatDataset, DistributedSampler
 from tqdm import tqdm
 import argparse
 import shutil
 import time
 from models.CDC import keyframe_compressor as compress_modules
-import torch
 from utils import *
 from tool.io import save_json
+
+
+def setup_distributed():
+    """
+    Initializes torch.distributed if launched via torchrun (RANK / WORLD_SIZE /
+    LOCAL_RANK env vars present and WORLD_SIZE > 1). Falls back to plain
+    single-GPU mode if launched with a bare `python train_vae2d.py` — so this
+    script still runs unchanged for quick local/interactive testing.
+
+    Returns: is_distributed (bool), rank (int), world_size (int), local_rank (int), device
+    """
+    if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        # Set the device BEFORE init_process_group, and pass it explicitly via
+        # device_id, so NCCL binds this rank to its GPU immediately instead of
+        # guessing based on "whatever device happens to be set" — the guess is
+        # usually right, but on a wrong guess this can silently hang.
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        dist.init_process_group(
+            backend="nccl", rank=rank, world_size=world_size, device_id=device
+        )
+        return True, rank, world_size, local_rank, device
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return False, 0, 1, 0, device
+
+
+def is_main_process(rank):
+    return rank == 0
+
+
+def unwrap_model(model):
+    """DDP wraps the real model as `model.module`. Use this anywhere you need
+    the underlying nn.Module (state_dict saving/loading, etc.)."""
+    return model.module if isinstance(model, DDP) else model
 
 
 def relative_rmse_error_ornl(original, reconstructed, device=None):
@@ -140,7 +179,7 @@ def get_argument():
         description="Train a UNet with Channel Attention model."
     )
     parser.add_argument(
-        "--batch_size", type=int, default=64, help="Batch size for training"
+        "--batch_size", type=int, default=64, help="Per-GPU batch size for training"
     )
     parser.add_argument(
         "--save_path",
@@ -172,6 +211,15 @@ def get_argument():
     parser.add_argument("--test_set", type=str, default="E3SM_test")
     parser.add_argument("--config", type=str, default="./configs/config_vae.yaml")
 
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=6,
+        help="DataLoader workers PER GPU PROCESS. With multi-GPU/DDP, total worker "
+        "processes spawned across all GPUs = num_workers * num_gpus, so reduce this "
+        "as you scale up GPUs if you're CPU-limited.",
+    )
+
     args = parser.parse_args()
 
     return args
@@ -180,13 +228,22 @@ def get_argument():
 if __name__ == "__main__":
     args = get_argument()
 
+    is_distributed, rank, world_size, local_rank, device = setup_distributed()
+
     save_path = args.save_path
 
-    # Ensure save path exists
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
+    # Only rank 0 touches the filesystem for setup, to avoid every process
+    # racing to create the same directory / copy the same config file.
+    if is_main_process(rank):
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        shutil.copy(args.config, save_path + "/config_vae.yaml")
+    if is_distributed:
+        dist.barrier()
 
-    shutil.copy(args.config, save_path + "/config_vae.yaml")
+    # Input block shapes are fixed across batches, so let cuDNN benchmark and
+    # cache the fastest conv algorithm instead of re-searching it each call.
+    torch.backends.cudnn.benchmark = True
 
     # Paths for model and JSON files
     model_path = os.path.join(
@@ -197,32 +254,63 @@ if __name__ == "__main__":
     )
 
     args.iterations = args.iterations * 1000
-    save_json(json_path, {"argument": vars(args)})
+    if is_distributed:
+        # cur_iters counts LOCAL batches per rank, but each rank only sees
+        # 1/world_size of the dataset per epoch (DistributedSampler splits it).
+        # Without this, hitting the same `cur_iters` target requires world_size
+        # times more total data than a single-GPU run with the same
+        # --iterations value — i.e. "same setting" silently means "3x more
+        # training" once you add GPUs. Dividing here keeps total data
+        # processed roughly constant across different GPU counts.
+        args.iterations = max(1, args.iterations // world_size)
+    if is_main_process(rank):
+        save_json(json_path, {"argument": vars(args)})
 
     train_args = convert_args(args, train=True)
 
-    print(train_args)
+    if is_main_process(rank):
+        print(train_args)
 
     train_datasets = build_dataset(train_args, syn_length=True)
-    print("Length for Each dataset", [len(dataset) for dataset in train_datasets])
+    if is_main_process(rank):
+        print("Length for Each dataset", [len(dataset) for dataset in train_datasets])
     merged_dataset = ConcatDataset(train_datasets)
 
-    train_loader = DataLoader(
-        merged_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=6,
-        pin_memory=True,
-    )
+    if is_distributed:
+        # DistributedSampler hands each rank a disjoint shard of the dataset each
+        # epoch — this replaces shuffle=True (sampler does the shuffling instead).
+        train_sampler = DistributedSampler(
+            merged_dataset, num_replicas=world_size, rank=rank, shuffle=True
+        )
+        train_loader = DataLoader(
+            merged_dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+    else:
+        train_sampler = None
+        train_loader = DataLoader(
+            merged_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
 
-    test_args = convert_args(args, train=False)
-    test_datasets = build_dataset(test_args, syn_length=False)
-    test_loaders = [
-        DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=3)
-        for dataset in test_datasets
-    ]
-    # Model and device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Evaluation only ever runs on rank 0 (see training loop below), so only
+    # rank 0 needs to build the test datasets/loaders at all.
+    test_loaders = []
+    if is_main_process(rank):
+        test_args = convert_args(args, train=False)
+        test_datasets = build_dataset(test_args, syn_length=False)
+        test_loaders = [
+            DataLoader(
+                dataset, batch_size=args.batch_size, shuffle=False, num_workers=3
+            )
+            for dataset in test_datasets
+        ]
 
     # main(args)
     if args.sr_dim <= 0:
@@ -244,20 +332,43 @@ if __name__ == "__main__":
             out_channels=1,
             sr_dim=args.sr_dim,
         )
-        print("loading VAE2D model with SR")
+        if is_main_process(rank):
+            print("loading VAE2D model with SR")
 
     if args.pretrain != "":
-        print("Load pretrain model:", args.pretrain)
-        state_dict = torch.load(args.pretrain)
+        if is_main_process(rank):
+            print("Load pretrain model:", args.pretrain)
+        state_dict = torch.load(args.pretrain, map_location="cpu")
         model.load_state_dict(state_dict)
 
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs!")
-        model = nn.DataParallel(model)  # Wrap model with DataParallel for multi-GPU
-    else:
-        print("Using a single GPU!")
-
     model = model.to(device)
+
+    if is_distributed:
+        # find_unused_parameters=True: this model's entropy bottleneck
+        # (FlexiblePrior/hyperprior) has at least one parameter that isn't on
+        # the differentiable path every forward pass, which DDP's strict
+        # default doesn't allow. This adds a small per-iteration overhead
+        # (extra autograd graph traversal to find unused params) but is
+        # required here — confirmed by the "Parameter indices which did not
+        # receive grad" error without it.
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+        if is_main_process(rank):
+            print(f"Using DistributedDataParallel across {world_size} GPUs!")
+    else:
+        if torch.cuda.device_count() > 1:
+            print(
+                f"{torch.cuda.device_count()} GPUs are visible, but this process "
+                "wasn't launched with torchrun, so only 1 GPU will be used. "
+                "Launch with: torchrun --nproc_per_node=<N_GPUS> train_vae2d.py ..."
+            )
+        else:
+            print("Using a single GPU!")
+
     # Loss function and optimizer
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -267,20 +378,30 @@ if __name__ == "__main__":
         gamma=args.lr_gamma,
     )
 
-    test_names = [loader.dataset.dataset_name for loader in test_loaders]
-    loggers = {name: Info(name, 32, model_path, json_path) for name in test_names}
+    loggers = {}
+    if is_main_process(rank):
+        test_names = [loader.dataset.dataset_name for loader in test_loaders]
+        loggers = {name: Info(name, 32, model_path, json_path) for name in test_names}
 
     cur_iters = 0
+    epoch_counter = 0
     is_eval = np.zeros(100, dtype=bool)
 
-    print(
-        f"Learning rate milestones: {[int(i/5*args.iterations) for i in range(1, 5)]}"
-    )
+    if is_main_process(rank):
+        print(
+            f"Learning rate milestones: {[int(i/5*args.iterations) for i in range(1, 5)]}"
+        )
 
     #     estimate the remaining time
     start_time = time.time()
 
     while cur_iters < args.iterations:
+
+        if is_distributed:
+            # Reseeds the sampler's shuffling each epoch — without this every
+            # epoch would hand out the exact same shard order to each rank.
+            train_sampler.set_epoch(epoch_counter)
+        epoch_counter += 1
 
         beta = (
             args.init_beta
@@ -304,41 +425,56 @@ if __name__ == "__main__":
         if not is_eval[eval_index]:
             is_eval[eval_index] = True
 
-            for test_loader in test_loaders:
-                cur_dataset = test_loader.dataset
-                dname = cur_dataset.dataset_name
-                original_data = cur_dataset.original_data()
+            # Only rank 0 evaluates and writes checkpoints/logs — model weights
+            # are identical across ranks at this point since DDP keeps gradients
+            # (and therefore parameters) in sync every step.
+            if is_main_process(rank):
+                eval_model = unwrap_model(model)
+                for test_loader in test_loaders:
+                    cur_dataset = test_loader.dataset
+                    dname = cur_dataset.dataset_name
+                    original_data = cur_dataset.original_data()
 
-                recons_data, bit_count = test_epoch_vae(
-                    model, test_loader, criterion, device
-                )
-                recons_data = cur_dataset.deblocking_hw(recons_data)
+                    recons_data, bit_count = test_epoch_vae(
+                        eval_model, test_loader, criterion, device
+                    )
+                    recons_data = cur_dataset.deblocking_hw(recons_data)
 
-                bpp = float(bit_count / np.prod(recons_data.shape))
+                    bpp = float(bit_count / np.prod(recons_data.shape))
 
-                nrmse = relative_rmse_error_ornl(original_data, recons_data)
-                nrmse = float(nrmse)
+                    nrmse = relative_rmse_error_ornl(original_data, recons_data)
+                    nrmse = float(nrmse)
 
-                loggers[dname].update(model, cur_iters, nrmse, bpp, dname)
+                    loggers[dname].update(eval_model, cur_iters, nrmse, bpp, dname)
+                    loggers[dname].save_last_model(eval_model)
 
-                loggers[dname].save_last_model(model)
+                    print(
+                        dname,
+                        f"Progress: {eval_index}/100 ,  Iter {cur_iters}, Train Loss: {train_loss:.6f} ({mse_loss:.6f} + {bbp_loss:.6f})",
+                        "NRMSE:",
+                        nrmse,
+                        f"BPP: {bpp:.6f} CR: {32/bpp:.6f}",
+                    )
 
-                print(
-                    dname,
-                    f"Progress: {eval_index}/100 ,  Iter {cur_iters}, Train Loss: {train_loss:.6f} ({mse_loss:.6f} + {bbp_loss:.6f})",
-                    "NRMSE:",
-                    nrmse,
-                    f"BPP: {bpp:.6f} CR: {32/bpp:.6f}",
-                )
+                    total_time = time.time() - start_time
+                    remaining_time = (args.iterations - cur_iters) * (
+                        total_time / cur_iters
+                    )
+                    print(
+                        f"Training time: {'%d:%d:%d'%(second_to_time(remaining_time))}/{'%d:%d:%d'%(second_to_time(total_time))}"
+                    )
 
-                total_time = time.time() - start_time
-                remaining_time = (args.iterations - cur_iters) * (
-                    total_time / cur_iters
-                )
-                print(
-                    f"Training time: {'%d:%d:%d'%(second_to_time(remaining_time))}/{'%d:%d:%d'%(second_to_time(total_time))}"
-                )
+                print()
 
-            print()
+            # Other ranks wait here while rank 0 evaluates/saves, so everyone
+            # re-enters train_epoch_vae together on the next loop iteration —
+            # DDP requires every rank to call forward/backward in lockstep.
+            if is_distributed:
+                dist.barrier()
 
-    print("Training complete.")
+    if is_distributed:
+        dist.barrier()
+        dist.destroy_process_group()
+
+    if is_main_process(rank):
+        print("Training complete.")
