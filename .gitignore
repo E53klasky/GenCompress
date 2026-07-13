@@ -1,0 +1,30 @@
+build/
+build_zstd/
+install/
+*.o
+*.o.d
+*.so
+*.a
+*.cmake
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.bin
+*.pt2
+exported_model/
+.vscode/
+*.f32
+# Ignore generated model files
+models/compress_models/
+pretrained_models/
+pretrained
+# Ignore Python cache (if any)
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+#venv
+venv
+venv_cpu
+exported_model
+build_script_atlas.sh
+pretrained

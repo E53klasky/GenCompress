@@ -288,6 +288,8 @@ if __name__ == "__main__":
             sampler=train_sampler,
             num_workers=args.num_workers,
             pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4,
         )
     else:
         train_sampler = None
@@ -446,7 +448,8 @@ if __name__ == "__main__":
                     nrmse = float(nrmse)
 
                     loggers[dname].update(eval_model, cur_iters, nrmse, bpp, dname)
-                    loggers[dname].save_last_model(eval_model)
+                    if eval_index % 10 == 0 or eval_index == 99:
+                        loggers[dname].save_last_model(eval_model)
 
                     print(
                         dname,
@@ -478,3 +481,20 @@ if __name__ == "__main__":
 
     if is_main_process(rank):
         print("Training complete.")
+
+    # Explicitly tear down the DataLoader (and its persistent workers) before
+    # exiting — persistent_workers=True keeps worker processes alive past the
+    # training loop, which otherwise leaves the job hanging even after
+    # "Training complete." has printed, since those child processes never
+    # get reaped.
+    del train_loader
+    if is_main_process(rank):
+        for tl in test_loaders:
+            del tl
+
+    import sys
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)  # hard exit — skips any lingering atexit/thread join hangs
+                 # from NCCL/DataLoader teardown once we've confirmed
+                 # training + cleanup logic above has already completed

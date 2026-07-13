@@ -33,6 +33,10 @@ E3SM_test:
     - 6
     variable_idx:
     - 0
+    - 1 
+    - 2
+    - 3
+    - 4
   train_subset:
     frame_range:
     - 0
@@ -46,6 +50,20 @@ E3SM_test:
     - 2
     - 3
     - 4
+Cavity2D:
+  data_path: /lustre/blue2/ranka/eklasky/postProcessing-/my_data/2049-4097/cavity2D_converted.npz
+  train_subset:
+    frame_range:
+      - 0
+      - 20
+    section_range:
+      - 0
+      - 1
+    variable_idx:
+      - 0
+      - 1
+      - 2
+      - 3
 ERA5:
   data_path: /blue/ranka/shared-xiaoli/ScientificDataset/ERA5/ERA5.npz
   test_subset:
@@ -254,3 +272,262 @@ train_config:
   norm_type: mean_range
   train: true
   train_size: 256
+GX_42x83:
+  data_path: /lustre/blue2/ranka/eklasky/GX/gx_5d_npz/gx_42x83.npz
+  train_subset:
+    frame_range:
+    - 0
+    - 204
+    section_range:
+    - 0
+    - 1
+    variable_idx:
+    - 0
+    - 1
+GX_2x83:
+  data_path: /lustre/blue2/ranka/eklasky/GX/gx_5d_npz/gx_2x83.npz
+  train_subset:
+    frame_range:
+    - 0
+    - 204
+    section_range:
+    - 0
+    - 1
+    variable_idx:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+GX_2x42:
+  data_path: /lustre/blue2/ranka/eklasky/GX/gx_5d_npz/gx_2x42.npz
+  train_subset:
+    frame_range:
+    - 0
+    - 204
+    section_range:
+    - 0
+    - 1
+    variable_idx:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+GX_2x96:
+  data_path: /lustre/blue2/ranka/eklasky/GX/gx_5d_npz/gx_2x96.npz
+  train_subset:
+    frame_range:
+    - 0
+    - 204
+    section_range:
+    - 0
+    - 1
+    variable_idx:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+Microscopy:
+  data_path: /lustre/orange/ranka/zhu.liangji/Microscopy/Microscopy.npz
+  train_subset:
+    frame_range:
+      - 0
+      - 256
+    section_range:
+      - 0
+      - 256
+    variable_idx:
+      - 0
+Turb_Rot:
+  data_path: /blue/ranka/zhu.liangji/Data/Turb-Rot/turb_rot.npz
+  test_subset:
+    frame_range:
+    - 0
+    - 256
+    section_range:
+    - 48
+    - 64
+    variable_idx:
+    - 0
+  train_subset:
+    frame_range:
+    - 0
+    - 256
+    section_range:
+    - 0
+    - 48
+    variable_idx:
+    - 0
+    - 1
+    - 2
+S3D_step3:
+  data_path: /blue/ranka/zhu.liangji/zhu_orange/S3D/S3D_40_104/S3D_512_step3.npz
+  test_subset:
+    frame_range:
+    - 0
+    - 16
+    section_range:
+    - 0
+    - 1
+    variable_idx:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    - 20
+    - 21
+    - 22
+    - 23
+    - 24
+    - 25
+    - 26
+    - 27
+    - 28
+    - 29
+    - 30
+    - 31
+    - 32
+    - 33
+    - 34
+    - 35
+    - 36
+    - 37
+    - 38
+    - 39
+    - 40
+    - 41
+    - 42
+    - 43
+    - 44
+    - 45
+    - 46
+    - 47
+    - 48
+    - 49
+    - 50
+    - 51
+    - 52
+    - 53
+    - 54
+    - 55
+    - 56
+    - 57
+GX_electron_real:
+  data_path: /blue/ranka/smajumder2/Ethan_Sai/GX/G_npz/electron_real.npz
+  test_subset:
+    frame_range:
+    - 32
+    - 48
+    section_range:
+    - 0
+    - 8
+    variable_idx:
+    - 0
+  train_subset:
+    frame_range:
+    - 0
+    - 48
+    section_range:
+    - 0
+    - 64
+    variable_idx:
+    - 0
+GX_electron_imag:
+  data_path: /blue/ranka/smajumder2/Ethan_Sai/GX/G_npz/electron_imag.npz
+  test_subset:
+    frame_range:
+    - 32
+    - 48
+    section_range:
+    - 0
+    - 8
+    variable_idx:
+    - 0
+  train_subset:
+    frame_range:
+    - 0
+    - 48
+    section_range:
+    - 0
+    - 64
+    variable_idx:
+    - 0
+GX_ion_real:
+  data_path: /blue/ranka/smajumder2/Ethan_Sai/GX/G_npz/ion_real.npz
+  test_subset:
+    frame_range:
+    - 32
+    - 48
+    section_range:
+    - 0
+    - 8
+    variable_idx:
+    - 0
+  train_subset:
+    frame_range:
+    - 0
+    - 48
+    section_range:
+    - 0
+    - 64
+    variable_idx:
+    - 0
+GX_ion_imag:
+  data_path: /blue/ranka/smajumder2/Ethan_Sai/GX/G_npz/ion_imag.npz
+  test_subset:
+    frame_range:
+    - 32
+    - 48
+    section_range:
+    - 0
+    - 8
+    variable_idx:
+    - 0
+  train_subset:
+    frame_range:
+    - 0
+    - 48
+    section_range:
+    - 0
+    - 64
+    variable_idx:
+    - 0
