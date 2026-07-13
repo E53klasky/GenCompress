@@ -21,6 +21,7 @@ pretrained
 # Ignore Python cache (if any)
 __pycache__/
 *.pyc
+*pyc
 .ipynb_checkpoints/
 #venv
 venv
