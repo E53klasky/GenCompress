@@ -24,14 +24,15 @@ import math
 
 
 def center_crop(x, tshape):
-    _, _,_, H, W = x.shape
-    
+    _, _, _, H, W = x.shape
+
     target_h, target_w = tshape
     start_h = (H - target_h) // 2
     start_w = (W - target_w) // 2
     end_h = start_h + target_h
     end_w = start_w + target_w
     return x[..., start_h:end_h, start_w:end_w]
+
 
 def downsampling_data(data, zoom_factors):
     """Apply cubic interpolation-based downsampling or upsampling."""
@@ -53,14 +54,14 @@ def block_hw(data, block_size=(256, 256)):
     n_w = W_target // w_block
 
     V1, S1, T1, H1, W1 = data.shape
-    data = data.view(V1*S1, T1, H1, W1)
+    data = data.view(V1 * S1, T1, H1, W1)
 
     # reflect padding requires pad amount < input size on that dim;
     # fall back to zero-padding when the block is larger than H or W
     if max(top, down) < H1 and max(left, right) < W1:
-        pad_mode = 'reflect'
+        pad_mode = "reflect"
     else:
-        pad_mode = 'constant'
+        pad_mode = "constant"
 
     data = F.pad(data, (left, right, top, down), mode=pad_mode)
     data = data.view(V1, S1, T1, *data.shape[-2:])
@@ -90,10 +91,9 @@ def deblock_hw(data, n_h, n_w, padding):
     H = H_p - top - down
     W = W_p - left - right
 
-    data = data[:, :, :, top:top+H, left:left+W]
+    data = data[:, :, :, top : top + H, left : left + W]
 
     return data
-
 
 
 def normalize_data(data, norm_type, axis):
@@ -137,7 +137,9 @@ def normalize_data(data, norm_type, axis):
         normalized_data = (data - var_mean) / var_scale
 
     else:
-        raise NotImplementedError(f"Normalization type '{norm_type}' is not implemented.")
+        raise NotImplementedError(
+            f"Normalization type '{norm_type}' is not implemented."
+        )
 
     return normalized_data, var_mean, var_scale
 
@@ -146,29 +148,26 @@ class BaseDataset(Dataset):
     def __init__(self, args):
         args = deepcopy(args)
         # Universal configs
-        self.dataset_name   = args.get("name", "E3SM")
-        self.data_path      = args["data_path"]
-        self.variable_idx   = args.get("variable_idx")
-        self.section_range  = args.get("section_range")
-        self.frame_range    = args.get("frame_range")
-        self.resolution     = args.get("resolution", None)
-        
-        self.train_size     = args.get("train_size", None)
-        self.n_frame        = args["n_frame"]
-        
-        self.inst_norm      = args.get("inst_norm")
-        self.augment_type   = args.get("augment_type", {})
-        self.norm_type      = args.get("norm_type")
-        
-        self.train_mode     = args.get("train")
-        
-        self.test_size      = args.get("test_size", None)
-        self.n_overlap      = args.get("n_overlap", 0)
-        self.downsampling   = args.get("downsampling", 1)
-        
-        
-        
-        
+        self.dataset_name = args.get("name", "E3SM")
+        self.data_path = args["data_path"]
+        self.variable_idx = args.get("variable_idx")
+        self.section_range = args.get("section_range")
+        self.frame_range = args.get("frame_range")
+        self.resolution = args.get("resolution", None)
+
+        self.train_size = args.get("train_size", None)
+        self.n_frame = args["n_frame"]
+
+        self.inst_norm = args.get("inst_norm")
+        self.augment_type = args.get("augment_type", {})
+        self.norm_type = args.get("norm_type")
+
+        self.train_mode = args.get("train")
+
+        self.test_size = args.get("test_size", None)
+        self.n_overlap = args.get("n_overlap", 0)
+        self.downsampling = args.get("downsampling", 1)
+
         self.random_crop = T.RandomCrop(size=(self.train_size, self.train_size))
 
         if "downsample" in self.augment_type:
@@ -179,134 +178,174 @@ class BaseDataset(Dataset):
             self.max_downsample = 1
 
         self.enble_ds = True
-        
-    def apply_augments(self,data):
-        
+
+    def apply_augments(self, data):
+
         if ("downsample" in self.augment_type) and self.enble_ds:
             data = self.apply_downsampling(data, step=self.augment_type["downsample"])
         elif ("randsample" in self.augment_type) and self.enble_ds:
             step = torch.randint(1, self.augment_type["randsample"] + 1, (1,)).item()
             data = self.apply_downsampling(data, step=step)
-            
+
         return data
 
     def apply_padding_or_crop(self, data):
-        cur_size = data.shape[-1]
-        if self.train_size > cur_size:
-            pad_size = self.train_size - cur_size
-            pad_left = pad_size // 2
-            pad_right = pad_size - pad_left
+        H, W = data.shape[-2], data.shape[-1]
+        target = self.train_size
 
-            # reflect padding requires pad < input size along that dim;
-            # fall back to zero-padding when the requested pad is too large
-            if max(pad_left, pad_right) < cur_size:
-                mode = 'reflect'
-            else:
-                mode = 'constant'
+        pad_top = pad_bottom = pad_left = pad_right = 0
+        need_pad = False
 
-            data = F.pad(data[None], (pad_left, pad_right, pad_left, pad_right), mode=mode)[0]
-        elif self.train_size < cur_size:
+        if target > H:
+            pad_h = target - H
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            need_pad = True
+        if target > W:
+            pad_w = target - W
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+            need_pad = True
+
+        if need_pad:
+            # reflect requires pad < input size on the dim it's applied to;
+            # fall back to constant if any computed pad exceeds either
+            # original spatial dim (covers small dims like GX_2x96's H=2)
+            min_spatial_dim = min(H, W)
+            max_pad = max(pad_top, pad_bottom, pad_left, pad_right)
+            mode = "reflect" if max_pad < min_spatial_dim else "constant"
+            data = F.pad(
+                data[None], (pad_left, pad_right, pad_top, pad_bottom), mode=mode
+            )[0]
+            H, W = data.shape[-2], data.shape[-1]
+
+        # After padding, both dims are >= target; crop whichever (or both)
+        # still exceed it. RandomCrop requires both dims >= target size.
+        if H > target or W > target:
             data = self.random_crop(data)
+
         return data
 
     def apply_inst_norm(self, data, return_norm=False):
         if self.norm_type == "mean_range":
-            offset = torch.mean(data).view([1,1,1])
-            scale = data.max() - data.min()            
-            assert scale != 0, "Scale is zero."
+            offset = torch.mean(data).view([1, 1, 1])
+            scale = data.max() - data.min()
+            # Flat/constant patch has zero range — fall back to scale=1
+            # instead of asserting, so normalization becomes a no-op shift
+            # rather than crashing the whole training run.
+            if scale == 0:
+                scale = torch.ones_like(scale)
             data = (data - offset) / scale
-            
-            offset = offset.view([1,1,1])
-            scale = scale.view([1,1,1])
-            
+
+            offset = offset.view([1, 1, 1])
+            scale = scale.view([1, 1, 1])
 
         elif self.norm_type == "min_max":
             dmin = data.min()
             dmax = data.max()
             offset = (dmax + dmin) / 2
             scale = (dmax - dmin) / 2
-            assert scale != 0, "Scale is zero."
+            if scale == 0:
+                scale = torch.ones_like(scale)
             data = (data - offset) / scale
-            
-            offset = offset.view([1,1,1])
-            scale = scale.view([1,1,1])
-            
+
+            offset = offset.view([1, 1, 1])
+            scale = scale.view([1, 1, 1])
 
         elif self.norm_type == "mean_range_hw":
             offset = torch.mean(data, dim=(-2, -1), keepdim=True)
-            scale = torch.amax(data, dim=(-2, -1), keepdim=True) - torch.amin(data, dim=(-2, -1), keepdim=True)
-            assert torch.all(scale != 0), "Scale is zero."
+            scale = torch.amax(data, dim=(-2, -1), keepdim=True) - torch.amin(
+                data, dim=(-2, -1), keepdim=True
+            )
+            # Per-slice zero-range fallback: any (t) slice that's flat gets
+            # scale=1 instead of failing the whole batch via torch.all().
+            scale = torch.where(scale == 0, torch.ones_like(scale), scale)
             data = (data - offset) / scale
 
         else:
-            raise NotImplementedError(f"Normalization type {self.norm_type} not implemented.")
+            raise NotImplementedError(
+                f"Normalization type {self.norm_type} not implemented."
+            )
 
         if return_norm:
             return data, offset, scale
         else:
             return data
 
-        
-    
+
 class ScientificDataset(BaseDataset):
     def __init__(self, args):
         super().__init__(args)
 
         print(f"*************** Loading {self.dataset_name} ***************")
-        
-        data = self.load_dataset(self.data_path, self.variable_idx, self.section_range, self.frame_range)
+
+        data = self.load_dataset(
+            self.data_path, self.variable_idx, self.section_range, self.frame_range
+        )
         print("Original Data Shape", data.shape)
 
         if not self.inst_norm:
-            assert(self.norm_type != "mean_range_hw")
-            data, var_offset, var_scale = normalize_data(data, self.norm_type, axis=(1, 2, 3, 4))
-            self.var_offset, self.var_scale = torch.FloatTensor(var_offset), torch.FloatTensor(var_scale)
+            assert self.norm_type != "mean_range_hw"
+            data, var_offset, var_scale = normalize_data(
+                data, self.norm_type, axis=(1, 2, 3, 4)
+            )
+            self.var_offset, self.var_scale = torch.FloatTensor(
+                var_offset
+            ), torch.FloatTensor(var_scale)
 
         data = torch.FloatTensor(data)
-        
 
         if not self.train_mode:
-        
+
             data, self.block_info = block_hw(data, self.test_size)
-            print("Testing Data Shape",data.shape)
-    
-    
+            print("Testing Data Shape", data.shape)
+
         self.shape = data.shape
         self.delta_t = self.n_frame - self.n_overlap
         self.t_samples = (self.shape[2] - self.n_frame) // self.delta_t + 1
         # print(self.shape[2],self.n_frame, self.delta_t)
-        assert (self.shape[2] - self.n_frame) % self.delta_t == 0, "Invalid n_frame or n_overlap config"
-        
+        assert (
+            self.shape[2] - self.n_frame
+        ) % self.delta_t == 0, "Invalid n_frame or n_overlap config"
+
         self.data_input = data  # store as instance variable for __getitem__
         self.visble_length = self.update_length()
-        
-        
-    def original_data(self,):
-        data =  self.data_input
-        
+
+    def original_data(
+        self,
+    ):
+        data = self.data_input
+
         if not self.train_mode:
             data = deblock_hw(data, *self.block_info)
-            
+
         if not self.inst_norm:
             data = data * self.var_scale + self.var_offset
-        
+
         return data
-        
 
     def load_dataset(self, data_path, variable_idx, section_range, frame_range):
-        frame_range   = slice(None) if frame_range   is None else slice(frame_range[0], frame_range[1])
-        section_range = slice(None) if section_range is None else slice(section_range[0], section_range[1])
+        frame_range = (
+            slice(None)
+            if frame_range is None
+            else slice(frame_range[0], frame_range[1])
+        )
+        section_range = (
+            slice(None)
+            if section_range is None
+            else slice(section_range[0], section_range[1])
+        )
 
         with np.load(data_path) as npzfile:
             data = npzfile["data"][variable_idx, section_range, frame_range]
-        
+
         if self.resolution is not None:
             data = center_crop(data, self.resolution)
         self.dtype = data.dtype
         data = data.astype(np.float32)
         return data
-    
-    def deblocking_hw(self,data):
+
+    def deblocking_hw(self, data):
         return deblock_hw(data, *self.block_info)
 
     def update_length(self):
@@ -324,8 +363,8 @@ class ScientificDataset(BaseDataset):
         if self.inst_norm:
             data, offset, scale = self.apply_inst_norm(data, True)
         else:
-            offset = self.var_offset[var_idx].view(1,1,1)
-            scale = self.var_scale[var_idx].view(1,1,1)
+            offset = self.var_offset[var_idx].view(1, 1, 1)
+            scale = self.var_scale[var_idx].view(1, 1, 1)
 
         data_dict = {"input": data[None], "offset": offset[None], "scale": scale[None]}
         return data_dict
@@ -342,6 +381,5 @@ class ScientificDataset(BaseDataset):
 
         data = self.data_input[idx0, idx1, start_t:end_t]
         data = self.post_processing(data, idx0, self.train_mode)
-        data["index"] = [idx0, idx1, start_t,end_t]
+        data["index"] = [idx0, idx1, start_t, end_t]
         return data
-
